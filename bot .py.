@@ -1,0 +1,192 @@
+import sqlite3, random, os
+from datetime import datetime, timedelta
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
+from PIL import Image, ImageDraw, ImageFont
+import requests
+from io import BytesIO
+
+# ------------------- Database Setup -------------------
+DB_FILE = "onepiece_rpg.db"
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+c = conn.cursor()
+
+# Players table
+c.execute("""CREATE TABLE IF NOT EXISTS players(
+    user_id INTEGER PRIMARY KEY,
+    name TEXT,
+    bounty INTEGER DEFAULT 0,
+    xp INTEGER DEFAULT 0,
+    level_points INTEGER DEFAULT 0,
+    level INTEGER DEFAULT 0,
+    fruit TEXT,
+    saved_balance INTEGER DEFAULT 0,
+    daily_claim TEXT,
+    weekly_claim TEXT,
+    join_claim INTEGER DEFAULT 0
+)""")
+
+# Characters table
+c.execute("""CREATE TABLE IF NOT EXISTS characters(
+    char_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    anime TEXT,
+    rarity TEXT,
+    image_url TEXT
+)""")
+
+# Owned characters
+c.execute("""CREATE TABLE IF NOT EXISTS owned_characters(
+    user_id INTEGER,
+    char_id INTEGER,
+    quantity INTEGER DEFAULT 1,
+    PRIMARY KEY(user_id,char_id)
+)""")
+
+# Spawned characters
+c.execute("""CREATE TABLE IF NOT EXISTS spawned_character(
+    char_id INTEGER,
+    claimed_by INTEGER
+)""")
+
+# Bans
+c.execute("""CREATE TABLE IF NOT EXISTS bans(
+    user_id INTEGER PRIMARY KEY,
+    type TEXT,
+    until TEXT
+)""")
+conn.commit()
+
+# ------------------- Owner & Bot -------------------
+OWNER_ID = -1001753034222
+BOT_TOKEN = "8012340576:AAHeSdblDQ40WZvuBChNz8iVN_xI8QFIe9c"
+
+# ------------------- Helpers -------------------
+def get_player(user_id, name):
+    c.execute("SELECT * FROM players WHERE user_id=?",(user_id,))
+    row = c.fetchone()
+    if not row:
+        c.execute("INSERT INTO players(user_id,name) VALUES(?,?)",(user_id,name))
+        conn.commit()
+        return get_player(user_id,name)
+    return row
+
+def update_player(user_id, column_values:dict):
+    columns = ", ".join(f"{k}=?" for k in column_values.keys())
+    values = list(column_values.values()) + [user_id]
+    c.execute(f"UPDATE players SET {columns} WHERE user_id=?", values)
+    conn.commit()
+
+def format_bounty(amount):
+    return f"฿ {amount:,}"
+
+# ------------------- Devil Fruits -------------------
+DEVIL_FRUITS = [
+    {"name":"Gomu Gomu no Mi","chance":40},
+    {"name":"Mochi Mochi no Mi","chance":20},
+    {"name":"Hito Hito no Mi, Model Nika","chance":5},
+    {"name":"Ope Ope no Mi","chance":20},
+    {"name":"Tori Tori no Mi","chance":20},
+    {"name":"Mera Mera no Mi","chance":30},
+    {"name":"Gura Gura no Mi","chance":25},
+]
+
+def buy_fruit(user_id):
+    player = get_player(user_id,"Unknown")
+    if player[6]: return None, "You already own a fruit!"
+    fruits, weights = [], []
+    for f in DEVIL_FRUITS:
+        fruits.append(f)
+        weights.append(f["chance"])
+    fruit = random.choices(fruits, weights=weights, k=1)[0]
+    update_player(user_id, {"fruit":fruit["name"]})
+    return fruit["name"], f"You got the fruit: {fruit['name']}!"
+
+def sell_fruit(user_id):
+    player = get_player(user_id,"Unknown")
+    if not player[6]: return "No fruit to sell."
+    price = 100_000_000
+    update_player(user_id, {"bounty": player[2]+price//2, "fruit":None})
+    return f"Sold fruit for {format_bounty(price//2)}"
+
+# ------------------- Characters -------------------
+RARITY_WEIGHTS = {"Common":60,"Uncommon":30,"Rare":10,"Epic":5,"Legend":3,"Limited":2,"Exotic":1}
+
+def spawn_character(update: Update):
+    c.execute("SELECT * FROM spawned_character")
+    if c.fetchone(): return
+    c.execute("SELECT * FROM characters")
+    chars = c.fetchall()
+    if not chars: update.message.reply_text("No characters in database."); return
+    weights = [RARITY_WEIGHTS.get(c[3],10) for c in chars]
+    char = random.choices(chars, weights=weights,k=1)[0]
+    c.execute("INSERT INTO spawned_character(char_id,claimed_by) VALUES(?,?)",(char[0],None))
+    conn.commit()
+    update.message.reply_text(f"A character has spawned! Use /catch <name> to catch it!")
+
+def catch_character(update: Update, context: CallbackContext):
+    user = update.effective_user
+    player = get_player(user.id, user.full_name)
+    c.execute("SELECT * FROM spawned_character")
+    spawned = c.fetchone()
+    if not spawned: update.message.reply_text("No character spawned."); return
+    if spawned[1]: update.message.reply_text(f"Already caught by user ID {spawned[1]}"); return
+    if not context.args: update.message.reply_text("Usage: /catch <name>"); return
+    guess = " ".join(context.args)
+    c.execute("SELECT name FROM characters WHERE char_id=?",(spawned[0],))
+    char_name = c.fetchone()[0]
+    if guess.lower()==char_name.lower():
+        c.execute("INSERT OR IGNORE INTO owned_characters(user_id,char_id) VALUES(?,?)",(user.id,spawned[0]))
+        c.execute("UPDATE spawned_character SET claimed_by=? WHERE char_id=?",(user.id,spawned[0]))
+        c.execute("DELETE FROM spawned_character WHERE char_id=?",(spawned[0],))
+        conn.commit()
+        update.message.reply_text(f"Congrats! You caught {char_name}!")
+    else:
+        update.message.reply_text("Wrong name!")
+
+# ------------------- Mini-game: RPS -------------------
+RPS_COOLDOWN = {}
+def rps(update: Update, context: CallbackContext):
+    user = update.effective_user
+    if not context.args: update.message.reply_text("Usage: /rps <rock/paper/scissors>"); return
+    if user.id in RPS_COOLDOWN and datetime.now() < RPS_COOLDOWN[user.id]:
+        update.message.reply_text("RPS cooldown active! Wait 20s.")
+        return
+    user_choice = context.args[0].lower()
+    bot_choice = random.choice(["rock","paper","scissors"])
+    result = ""
+    if user_choice==bot_choice: result="Draw!"
+    elif (user_choice=="rock" and bot_choice=="scissors") or (user_choice=="paper" and bot_choice=="rock") or (user_choice=="scissors" and bot_choice=="paper"): result="You win!"
+    else: result="You lose!"
+    RPS_COOLDOWN[user.id] = datetime.now() + timedelta(seconds=20)
+    update.message.reply_text(f"You chose {user_choice}, Bot chose {bot_choice}. {result}")
+
+# ------------------- Wanted Poster -------------------
+def generate_wanted_poster(update: Update, context: CallbackContext):
+    user = update.effective_user
+    player = get_player(user.id, user.full_name)
+    img = Image.new('RGB',(400,600),(255,255,200))
+    d = ImageDraw.Draw(img)
+    font = ImageFont.load_default()
+    d.text((100,50),"WANTED",fill=(0,0,0),font=font)
+    d.text((100,80),"Dead or Alive",fill=(0,0,0),font=font)
+    d.text((50,500),f"{player[1]}",fill=(0,0,0),font=font)
+    d.text((50,530),f"BOUNTY: {format_bounty(player[2])}",fill=(0,0,0),font=font)
+    try:
+        photo_file = context.bot.get_user_profile_photos(user.id).photos[0][0].get_file()
+        response = requests.get(photo_file.file_path)
+        avatar = Image.open(BytesIO(response.content)).resize((150,150))
+        img.paste(avatar,(125,150))
+    except: pass
+    bio=BytesIO()
+    bio.name='wanted.png'
+    img.save(bio,'PNG'); bio.seek(0)
+    update.message.reply_photo(photo=bio)
+
+# ------------------- PvP Combat -------------------
+COMBAT_COOLDOWN = {}
+def combat(update: Update, context: CallbackContext):
+    user = update.effective_user
+    player = get_player(user.id,user.full_name)
+    if len(context.args)<1: update.message.reply_text("Usage: /combat <opponent_user_id>"); return
+    opponent_id=int(context.args[0])
