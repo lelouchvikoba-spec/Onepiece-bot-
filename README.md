@@ -1,2 +1,0 @@
-# Onepiece-bot-
-Hi
